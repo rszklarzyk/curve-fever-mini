@@ -33,7 +33,11 @@
   #alert .rev { color: #ff6b6b; }
   #alert .ghost { color: #9fd8ff; }
   #alert .fast { color: #ffd11a; }
+  #alert .beer { color: #e8c15a; }
   .legend { font-size: 14px; line-height: 1.7; }
+  #freeze { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; color: #ff5c8a; font-weight: 800; text-shadow: 0 3px 10px #000; pointer-events: none; text-align: center; }
+  #freeze .t { font-size: clamp(16px, 3.4vw, 30px); }
+  #freeze .n { font-size: clamp(48px, 12vw, 110px); line-height: 1; }
 </style>
 </head>
 <body>
@@ -58,7 +62,7 @@
     <button id="copy" class="secondary">Kopiuj</button>
   </div>
   <div class="muted">Wyślij link znajomym. Sterowanie: ← → lub A / D (na telefonie: dotknij lewej/prawej połowy ekranu). Dwie osoby na jednym komputerze: dodaj drugiego gracza — gracz 1 gra strzałkami, gracz 2 klawiszami A / D.</div>
-  <div class="legend muted">Bonusy (działają 10 s):<br>🔄 odwraca sterowanie wszystkim przeciwnikom<br>👻 przenikasz przez linie<br>🗜️ mapa kurczy się o 20%<br>⚡ przeciwnicy jadą 2× szybciej</div>
+  <div class="legend muted">Bonusy (działają 10 s):<br>🔄 odwraca sterowanie wszystkim przeciwnikom<br>👻 przenikasz przez linie<br>🗜️ mapa kurczy się o 20%<br>⚡ przeciwnicy jadą 2× szybciej<br>🍺 Czarna Perła Mocna 7,9%: jedziesz szybciej i przenikasz przez linie<br>🍒 Soplica wiśniowa 200 ml: pułapka — WSZYSCY (też Ty) zamarzają na 15 s</div>
   <ul id="lobbyList"></ul>
   <button id="addLocal" class="secondary">+ Drugi gracz na tym komputerze</button>
   <button id="start">Start gry</button>
@@ -73,6 +77,7 @@
     <div id="msg"></div>
     <div id="fx"></div>
     <div id="alert"></div>
+    <div id="freeze"></div>
   </div>
   <div id="side">
     <div class="muted">Pokój: <b id="roomCode"></b></div>
@@ -90,7 +95,7 @@ const socket = io();
 let myId = null, myId2 = null, roomId = null, players = {}, hostId = null, state = 'lobby';
 let last = {}; // idx -> {x,y,color}
 let fx = null, curTick = 0; // stan bonusów z serwera i aktualny tick
-const PU = { reverse: { icon: '🔄', color: '#ff4d4d' }, ghost: { icon: '👻', color: '#4da6ff' }, shrink: { icon: '🗜️', color: '#ff9933' }, speed: { icon: '⚡', color: '#ffd11a' } };
+const PU = { reverse: { icon: '🔄', color: '#ff4d4d' }, ghost: { icon: '👻', color: '#4da6ff' }, shrink: { icon: '🗜️', color: '#ff9933' }, speed: { icon: '⚡', color: '#ffd11a' }, beer: { icon: '🍺', color: '#c8a24a' }, vodka: { icon: '🍒', color: '#e0306a' } };
 const trails = $('trails').getContext('2d');
 const heads = $('heads').getContext('2d');
 
@@ -145,7 +150,7 @@ socket.on('roundStart', d => {
   trails.clearRect(0, 0, 800, 600);
   last = {};
   fx = null; curTick = 0;
-  $('fx').innerHTML = $('alert').innerHTML = '';
+  $('fx').innerHTML = $('alert').innerHTML = $('freeze').innerHTML = '';
   for (const p of d.players) last[p.idx] = { x: p.x, y: p.y, color: p.color, angle: p.angle };
   drawHeads(true);
   let n = Math.ceil(d.countdown);
@@ -193,6 +198,16 @@ function drawHeads(withArrows) {
     heads.fillRect(0, y0, x0, h); heads.fillRect(x0 + w, y0, 800 - x0 - w, h);
     heads.strokeStyle = '#ff4d4d'; heads.lineWidth = 3; heads.strokeRect(x0, y0, w, h);
   }
+  // Soplica: sypiące się wiśnie
+  if (fx && curTick < fx.freezeEnd) {
+    const el = curTick - fx.freezeStart;
+    heads.font = '22px system-ui'; heads.textAlign = 'center'; heads.textBaseline = 'middle';
+    for (let i = 0; i < 30; i++) {
+      const x = (i * 137 + 40) % 800, v = 1.5 + (i % 5) * 0.6;
+      const y = ((el * v + i * 71) % 680) - 40;
+      heads.fillText('🍒', x + Math.sin((el + i * 20) / 25) * 12, y);
+    }
+  }
   // Bonusy na mapie
   if (fx) for (const u of fx.powerups) {
     const t = PU[u.type];
@@ -207,6 +222,10 @@ function drawHeads(withArrows) {
     if (e && !l.dead && secs(e.ghostUntil) > 0) {
       heads.strokeStyle = 'rgba(160,220,255,0.8)'; heads.lineWidth = 2;
       heads.beginPath(); heads.arc(l.x, l.y, 8, 0, Math.PI * 2); heads.stroke();
+    }
+    if (e && !l.dead && secs(e.frozenUntil) > 0) {
+      heads.strokeStyle = 'rgba(230,50,110,0.9)'; heads.lineWidth = 3;
+      heads.beginPath(); heads.arc(l.x, l.y, 12, 0, Math.PI * 2); heads.stroke();
     }
     if (e && !l.dead && secs(e.speedUntil) > 0) {
       heads.strokeStyle = 'rgba(255,210,30,0.9)'; heads.lineWidth = 2;
@@ -279,12 +298,16 @@ function updateHud() {
   if (!fx) return;
   const name = idx => players[idx] ? esc(players[idx].name) : '?';
   const lines = [];
+  const fzAll = secs(fx.freezeEnd);
+  if (fzAll > 0) lines.push(`🍒 Soplica (od ${esc(fx.freezeBy || '')}): wszyscy stoją — ${fzAll.toFixed(1)} s`);
+  $('freeze').innerHTML = fzAll > 0 ? `<div class="t">🍒 SOPLICA WIŚNIOWA 🍒<br>wszyscy stoją!</div><div class="n">${Math.ceil(fzAll)}</div>` : '';
   const s = secs(fx.shrinkEnd);
   if (s > 0) lines.push(`🗜️ Mapa zmniejszona (${esc(fx.shrinkBy || '')}) — ${s.toFixed(1)} s`);
   const revBy = {}, fastBy = {};
   for (const e of fx.players) {
-    const g = secs(e.ghostUntil);
-    if (g > 0) lines.push(`👻 ${name(e.idx)} przenika linie — ${g.toFixed(1)} s`);
+    const g = secs(e.ghostUntil), bb = secs(e.boostUntil);
+    if (bb > 0) lines.push(`🍺 ${name(e.idx)} po Czarnej Perle: szybciej + przenika — ${bb.toFixed(1)} s`);
+    if (g > 0 && bb <= 0) lines.push(`👻 ${name(e.idx)} przenika linie — ${g.toFixed(1)} s`);
     const r = secs(e.reverseUntil);
     if (r > 0) (revBy[e.reverseBy] ||= { t: r, who: [] }).who.push(name(e.idx));
     const f = secs(e.speedUntil);
@@ -299,11 +322,12 @@ function updateHud() {
   for (const p of mine) {
     const e = fxPlayer(p.idx);
     if (!e || !p.alive) continue;
-    const r = secs(e.reverseUntil), g = secs(e.ghostUntil), f = secs(e.speedUntil);
+    const r = secs(e.reverseUntil), g = secs(e.ghostUntil), f = secs(e.speedUntil), bb = secs(e.boostUntil);
     const who = mine.length > 1 ? esc(p.name) + ': ' : '';
     if (r > 0) alerts.push(`<div class="rev">🔄 ${who}ODWRÓCONE STEROWANIE ${Math.ceil(r)} s</div>`);
+    if (bb > 0) alerts.push(`<div class="beer">🍺 ${who}CZARNA PERŁA — SZYBCIEJ + PRZENIKASZ ${Math.ceil(bb)} s</div>`);
     if (f > 0) alerts.push(`<div class="fast">⚡ ${who}PRZYSPIESZENIE 2× ${Math.ceil(f)} s</div>`);
-    if (g > 0) alerts.push(`<div class="ghost">👻 ${who}PRZENIKASZ PRZEZ LINIE ${Math.ceil(g)} s</div>`);
+    if (g > 0 && bb <= 0) alerts.push(`<div class="ghost">👻 ${who}PRZENIKASZ PRZEZ LINIE ${Math.ceil(g)} s</div>`);
   }
   $('alert').innerHTML = alerts.join('');
 }
