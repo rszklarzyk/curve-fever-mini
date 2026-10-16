@@ -51,8 +51,9 @@
     <input id="link" readonly>
     <button id="copy" class="secondary">Kopiuj</button>
   </div>
-  <div class="muted">Wyślij link znajomym. Sterowanie: ← → lub A / D (na telefonie: dotknij lewej/prawej połowy ekranu).</div>
+  <div class="muted">Wyślij link znajomym. Sterowanie: ← → lub A / D (na telefonie: dotknij lewej/prawej połowy ekranu). Dwie osoby na jednym komputerze: dodaj drugiego gracza — gracz 1 gra strzałkami, gracz 2 klawiszami A / D.</div>
   <ul id="lobbyList"></ul>
+  <button id="addLocal" class="secondary">+ Drugi gracz na tym komputerze</button>
   <button id="start">Start gry</button>
   <div id="waitHost" class="muted">Czekamy aż host wystartuje grę…</div>
 </div>
@@ -65,10 +66,11 @@
     <div id="msg"></div>
   </div>
   <div id="side">
+    <div class="muted">Pokój: <b id="roomCode"></b></div>
     <strong>Wyniki</strong>
     <ul id="scores"></ul>
     <button id="stop" class="secondary hidden">Zakończ grę</button>
-    <div class="muted">← → / A D</div>
+    <div id="help" class="muted">← → / A D</div>
   </div>
 </div>
 
@@ -76,7 +78,7 @@
 <script>
 const $ = id => document.getElementById(id);
 const socket = io();
-let myId = null, roomId = null, players = {}, hostId = null, state = 'lobby';
+let myId = null, myId2 = null, roomId = null, players = {}, hostId = null, state = 'lobby';
 let last = {}; // idx -> {x,y,color}
 const trails = $('trails').getContext('2d');
 const heads = $('heads').getContext('2d');
@@ -104,6 +106,7 @@ socket.on('joined', d => {
   myId = d.id; roomId = d.roomId;
   history.replaceState(null, '', '?room=' + roomId);
   $('roomName').textContent = roomId;
+  $('roomCode').textContent = roomId;
   $('link').value = location.origin + '/?room=' + roomId;
   show('lobby');
 });
@@ -115,7 +118,7 @@ socket.on('lobby', d => {
   players = {};
   for (const p of d.players) players[p.idx] = p;
   const sorted = [...d.players].sort((a, b) => b.score - a.score);
-  const item = p => `<li class="${state === 'playing' && !p.alive ? 'dead' : ''}"><span><span class="dot" style="background:${p.color}"></span> ${esc(p.name)}${p.id === hostId ? ' 👑' : ''}${p.id === myId ? ' (ty)' : ''}</span><b>${state === 'playing' ? p.score : ''}</b></li>`;
+  const item = p => `<li class="${state === 'playing' && !p.alive ? 'dead' : ''}"><span><span class="dot" style="background:${p.color}"></span> ${esc(p.name)}${p.id === hostId ? ' 👑' : ''}${p.id === myId || p.id === myId2 ? ' (ty)' : ''}</span><b>${state === 'playing' ? p.score : ''}</b></li>`;
   $('lobbyList').innerHTML = d.players.map(item).join('');
   $('scores').innerHTML = sorted.map(item).join('');
   const isHost = hostId === myId;
@@ -168,20 +171,49 @@ function drawHeads(withArrows) {
 }
 
 // --- Sterowanie ---
-const keys = { left: false, right: false };
-let lastDir = 0;
-function sendDir() {
-  const dir = (keys.right ? 1 : 0) - (keys.left ? 1 : 0);
-  if (dir !== lastDir) { lastDir = dir; socket.emit('input', dir); }
+// Gracz 1 = socket, gracz 2 (opcjonalny, ten sam komputer) = socket2
+const ctl = [
+  { sock: socket, keys: { left: false, right: false }, lastDir: 0 },
+  { sock: null, keys: { left: false, right: false }, lastDir: 0 },
+];
+function sendDir(c) {
+  if (!c.sock) return;
+  const dir = (c.keys.right ? 1 : 0) - (c.keys.left ? 1 : 0);
+  if (dir !== c.lastDir) { c.lastDir = dir; c.sock.emit('input', dir); }
 }
-const keyMap = { ArrowLeft: 'left', a: 'left', A: 'left', ArrowRight: 'right', d: 'right', D: 'right' };
-addEventListener('keydown', e => { if (keyMap[e.key] && document.activeElement.tagName !== 'INPUT') { keys[keyMap[e.key]] = true; sendDir(); e.preventDefault(); } });
-addEventListener('keyup', e => { if (keyMap[e.key]) { keys[keyMap[e.key]] = false; sendDir(); } });
+// Bez drugiego gracza: strzałki i A/D sterują graczem 1. Z drugim: strzałki = gracz 1, A/D = gracz 2.
+function keyTarget(code) {
+  if (code === 'ArrowLeft' || code === 'ArrowRight') return [ctl[0], code === 'ArrowLeft' ? 'left' : 'right'];
+  if (code === 'KeyA' || code === 'KeyD') return [ctl[1].sock ? ctl[1] : ctl[0], code === 'KeyA' ? 'left' : 'right'];
+  return null;
+}
+addEventListener('keydown', e => {
+  const t = keyTarget(e.code);
+  if (t && document.activeElement.tagName !== 'INPUT') { t[0].keys[t[1]] = true; sendDir(t[0]); e.preventDefault(); }
+});
+addEventListener('keyup', e => {
+  const t = keyTarget(e.code);
+  if (t) { t[0].keys[t[1]] = false; sendDir(t[0]); }
+});
+
+$('addLocal').onclick = () => {
+  const name = (prompt('Imię drugiego gracza (sterowanie A / D):', 'Gracz 2') || '').trim();
+  if (!name) return;
+  const s = io({ forceNew: true });
+  s.on('joined', d => { myId2 = d.id; ctl[1].sock = s; $('addLocal').classList.add('hidden'); updateHelp(); });
+  s.on('err', m => alert(m));
+  s.emit('join', { roomId, name });
+};
+function updateHelp() {
+  $('help').textContent = ctl[1].sock ? 'Gracz 1: ← →   Gracz 2: A D' : '← → / A D';
+}
+
 function touches(e) {
   if ($('game').classList.contains('hidden') || e.target.tagName === 'BUTTON') return;
-  keys.left = keys.right = false;
-  for (const t of e.touches) keys[t.clientX < innerWidth / 2 ? 'left' : 'right'] = true;
-  sendDir();
+  const k = ctl[0].keys;
+  k.left = k.right = false;
+  for (const t of e.touches) k[t.clientX < innerWidth / 2 ? 'left' : 'right'] = true;
+  sendDir(ctl[0]);
   e.preventDefault();
 }
 for (const ev of ['touchstart', 'touchmove', 'touchend', 'touchcancel']) addEventListener(ev, touches, { passive: false });
