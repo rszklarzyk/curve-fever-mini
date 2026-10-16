@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Curve Fever Mini</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #111; color: #eee; font-family: system-ui, sans-serif; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .hidden { display: none !important; }
+  .card { background: #1c1c1c; padding: 28px; border-radius: 12px; width: min(420px, 92vw); display: flex; flex-direction: column; gap: 12px; }
+  h1 { margin: 0 0 8px; font-size: 28px; }
+  input, button { font: inherit; padding: 10px 12px; border-radius: 8px; border: 1px solid #333; background: #0d0d0d; color: #eee; }
+  button { background: #4da6ff; color: #000; border: 0; font-weight: 600; cursor: pointer; }
+  button.secondary { background: #333; color: #eee; }
+  .row { display: flex; gap: 8px; }
+  .row > input { flex: 1; min-width: 0; }
+  ul { list-style: none; padding: 0; margin: 0; }
+  li { padding: 4px 0; display: flex; gap: 8px; align-items: center; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+  .muted { color: #888; font-size: 14px; }
+  .err { color: #ff6b6b; }
+  #game { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; justify-content: center; padding: 12px; }
+  #board { position: relative; width: min(800px, 96vw); aspect-ratio: 4 / 3; }
+  #board canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #trails { background: #000; border: 2px solid #444; }
+  #msg { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 40px; font-weight: 700; text-shadow: 0 2px 8px #000; pointer-events: none; text-align: center; }
+  #side { width: 200px; display: flex; flex-direction: column; gap: 12px; }
+  #side li { justify-content: space-between; }
+  .dead { opacity: .4; }
+</style>
+</head>
+<body>
+
+<!-- Ekran startowy -->
+<div id="home" class="card">
+  <h1>🐍 Curve Fever Mini</h1>
+  <input id="name" placeholder="Twoje imię" maxlength="16">
+  <button id="create">Stwórz pokój</button>
+  <div class="row">
+    <input id="code" placeholder="Kod pokoju">
+    <button id="joinBtn" class="secondary">Dołącz</button>
+  </div>
+  <div id="homeErr" class="err"></div>
+</div>
+
+<!-- Lobby -->
+<div id="lobby" class="card hidden">
+  <h1>Pokój <span id="roomName"></span></h1>
+  <div class="row">
+    <input id="link" readonly>
+    <button id="copy" class="secondary">Kopiuj</button>
+  </div>
+  <div class="muted">Wyślij link znajomym. Sterowanie: ← → lub A / D (na telefonie: dotknij lewej/prawej połowy ekranu).</div>
+  <ul id="lobbyList"></ul>
+  <button id="start">Start gry</button>
+  <div id="waitHost" class="muted">Czekamy aż host wystartuje grę…</div>
+</div>
+
+<!-- Gra -->
+<div id="game" class="hidden">
+  <div id="board">
+    <canvas id="trails" width="800" height="600"></canvas>
+    <canvas id="heads" width="800" height="600"></canvas>
+    <div id="msg"></div>
+  </div>
+  <div id="side">
+    <strong>Wyniki</strong>
+    <ul id="scores"></ul>
+    <button id="stop" class="secondary hidden">Zakończ grę</button>
+    <div class="muted">← → / A D</div>
+  </div>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const socket = io();
+let myId = null, roomId = null, players = {}, hostId = null, state = 'lobby';
+let last = {}; // idx -> {x,y,color}
+const trails = $('trails').getContext('2d');
+const heads = $('heads').getContext('2d');
+
+try { $('name').value = localStorage.getItem('cf-name') || ''; } catch {}
+const params = new URLSearchParams(location.search);
+if (params.get('room')) { $('code').value = params.get('room'); $('create').classList.add('hidden'); $('joinBtn').classList.remove('secondary'); }
+
+function show(id) { for (const s of ['home', 'lobby', 'game']) $(s).classList.toggle('hidden', s !== id); }
+
+function join(code) {
+  const name = $('name').value.trim() || 'Gracz';
+  try { localStorage.setItem('cf-name', name); } catch {}
+  socket.emit('join', { roomId: code, name });
+}
+$('create').onclick = () => join(Math.random().toString(36).slice(2, 7));
+$('joinBtn').onclick = () => { const c = $('code').value.trim(); if (c) join(c); };
+$('code').onkeydown = e => { if (e.key === 'Enter') $('joinBtn').click(); };
+$('copy').onclick = () => { $('link').select(); navigator.clipboard?.writeText($('link').value); $('copy').textContent = 'Skopiowano!'; };
+$('start').onclick = () => socket.emit('start');
+$('stop').onclick = () => socket.emit('stop');
+
+socket.on('err', m => $('homeErr').textContent = m);
+socket.on('joined', d => {
+  myId = d.id; roomId = d.roomId;
+  history.replaceState(null, '', '?room=' + roomId);
+  $('roomName').textContent = roomId;
+  $('link').value = location.origin + '/?room=' + roomId;
+  show('lobby');
+});
+
+socket.on('lobby', d => {
+  hostId = d.hostId;
+  const wasPlaying = state === 'playing';
+  state = d.state;
+  players = {};
+  for (const p of d.players) players[p.idx] = p;
+  const sorted = [...d.players].sort((a, b) => b.score - a.score);
+  const item = p => `<li class="${state === 'playing' && !p.alive ? 'dead' : ''}"><span><span class="dot" style="background:${p.color}"></span> ${esc(p.name)}${p.id === hostId ? ' 👑' : ''}${p.id === myId ? ' (ty)' : ''}</span><b>${state === 'playing' ? p.score : ''}</b></li>`;
+  $('lobbyList').innerHTML = d.players.map(item).join('');
+  $('scores').innerHTML = sorted.map(item).join('');
+  const isHost = hostId === myId;
+  $('start').classList.toggle('hidden', !isHost);
+  $('waitHost').classList.toggle('hidden', isHost);
+  $('stop').classList.toggle('hidden', !isHost);
+  if (state === 'lobby' && myId) show('lobby');
+  if (state === 'playing' && !wasPlaying) show('game');
+});
+
+socket.on('roundStart', d => {
+  show('game');
+  trails.clearRect(0, 0, 800, 600);
+  last = {};
+  for (const p of d.players) last[p.idx] = { x: p.x, y: p.y, color: p.color, angle: p.angle };
+  drawHeads(true);
+  let n = Math.ceil(d.countdown);
+  const tickDown = () => { $('msg').textContent = n > 0 ? n : ''; if (n-- > 0) setTimeout(tickDown, 1000 * d.countdown / Math.ceil(d.countdown)); };
+  tickDown();
+});
+
+socket.on('tick', list => {
+  trails.lineWidth = 4;
+  trails.lineCap = 'round';
+  for (const [idx, x, y, draw, alive] of list) {
+    const l = last[idx];
+    if (!l) continue;
+    if (draw) {
+      trails.strokeStyle = l.color;
+      trails.beginPath(); trails.moveTo(l.x, l.y); trails.lineTo(x, y); trails.stroke();
+    }
+    l.x = x; l.y = y; l.dead = !alive;
+  }
+  drawHeads(false);
+});
+
+socket.on('roundEnd', d => { $('msg').textContent = d.winner ? `${d.winner} wygrywa rundę!` : 'Koniec rundy'; });
+
+function drawHeads(withArrows) {
+  heads.clearRect(0, 0, 800, 600);
+  for (const l of Object.values(last)) {
+    heads.fillStyle = l.dead ? '#555' : '#ffeb3b';
+    heads.beginPath(); heads.arc(l.x, l.y, 3, 0, Math.PI * 2); heads.fill();
+    if (withArrows) {
+      heads.strokeStyle = l.color; heads.lineWidth = 2;
+      heads.beginPath(); heads.moveTo(l.x, l.y);
+      heads.lineTo(l.x + Math.cos(l.angle) * 25, l.y + Math.sin(l.angle) * 25); heads.stroke();
+    }
+  }
+}
+
+// --- Sterowanie ---
+const keys = { left: false, right: false };
+let lastDir = 0;
+function sendDir() {
+  const dir = (keys.right ? 1 : 0) - (keys.left ? 1 : 0);
+  if (dir !== lastDir) { lastDir = dir; socket.emit('input', dir); }
+}
+const keyMap = { ArrowLeft: 'left', a: 'left', A: 'left', ArrowRight: 'right', d: 'right', D: 'right' };
+addEventListener('keydown', e => { if (keyMap[e.key] && document.activeElement.tagName !== 'INPUT') { keys[keyMap[e.key]] = true; sendDir(); e.preventDefault(); } });
+addEventListener('keyup', e => { if (keyMap[e.key]) { keys[keyMap[e.key]] = false; sendDir(); } });
+function touches(e) {
+  if ($('game').classList.contains('hidden') || e.target.tagName === 'BUTTON') return;
+  keys.left = keys.right = false;
+  for (const t of e.touches) keys[t.clientX < innerWidth / 2 ? 'left' : 'right'] = true;
+  sendDir();
+  e.preventDefault();
+}
+for (const ev of ['touchstart', 'touchmove', 'touchend', 'touchcancel']) addEventListener(ev, touches, { passive: false });
+
+function esc(s) { return s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+</script>
+</body>
+</html>
