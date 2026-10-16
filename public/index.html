@@ -32,6 +32,7 @@
   #alert { position: absolute; left: 0; right: 0; bottom: 12px; text-align: center; font-size: clamp(12px, 2.6vw, 22px); font-weight: 700; text-shadow: 0 2px 6px #000; pointer-events: none; }
   #alert .rev { color: #ff6b6b; }
   #alert .ghost { color: #9fd8ff; }
+  #alert .fast { color: #ffd11a; }
   .legend { font-size: 14px; line-height: 1.7; }
 </style>
 </head>
@@ -57,7 +58,7 @@
     <button id="copy" class="secondary">Kopiuj</button>
   </div>
   <div class="muted">Wyślij link znajomym. Sterowanie: ← → lub A / D (na telefonie: dotknij lewej/prawej połowy ekranu). Dwie osoby na jednym komputerze: dodaj drugiego gracza — gracz 1 gra strzałkami, gracz 2 klawiszami A / D.</div>
-  <div class="legend muted">Bonusy (działają 10 s):<br>🔄 odwraca sterowanie wszystkim przeciwnikom<br>👻 przenikasz przez linie<br>🗜️ mapa kurczy się o 20%</div>
+  <div class="legend muted">Bonusy (działają 10 s):<br>🔄 odwraca sterowanie wszystkim przeciwnikom<br>👻 przenikasz przez linie<br>🗜️ mapa kurczy się o 20%<br>⚡ przeciwnicy jadą 2× szybciej</div>
   <ul id="lobbyList"></ul>
   <button id="addLocal" class="secondary">+ Drugi gracz na tym komputerze</button>
   <button id="start">Start gry</button>
@@ -89,7 +90,7 @@ const socket = io();
 let myId = null, myId2 = null, roomId = null, players = {}, hostId = null, state = 'lobby';
 let last = {}; // idx -> {x,y,color}
 let fx = null, curTick = 0; // stan bonusów z serwera i aktualny tick
-const PU = { reverse: { icon: '🔄', color: '#ff4d4d' }, ghost: { icon: '👻', color: '#4da6ff' }, shrink: { icon: '🗜️', color: '#ff9933' } };
+const PU = { reverse: { icon: '🔄', color: '#ff4d4d' }, ghost: { icon: '👻', color: '#4da6ff' }, shrink: { icon: '🗜️', color: '#ff9933' }, speed: { icon: '⚡', color: '#ffd11a' } };
 const trails = $('trails').getContext('2d');
 const heads = $('heads').getContext('2d');
 
@@ -207,6 +208,10 @@ function drawHeads(withArrows) {
       heads.strokeStyle = 'rgba(160,220,255,0.8)'; heads.lineWidth = 2;
       heads.beginPath(); heads.arc(l.x, l.y, 8, 0, Math.PI * 2); heads.stroke();
     }
+    if (e && !l.dead && secs(e.speedUntil) > 0) {
+      heads.strokeStyle = 'rgba(255,210,30,0.9)'; heads.lineWidth = 2;
+      heads.beginPath(); heads.arc(l.x, l.y, 10, 0, Math.PI * 2); heads.stroke();
+    }
     if (e && !l.dead && secs(e.reverseUntil) > 0) {
       heads.strokeStyle = 'rgba(255,80,80,0.9)'; heads.lineWidth = 2;
       heads.beginPath(); heads.arc(l.x, l.y, 6, 0, Math.PI * 2); heads.stroke();
@@ -276,13 +281,16 @@ function updateHud() {
   const lines = [];
   const s = secs(fx.shrinkEnd);
   if (s > 0) lines.push(`🗜️ Mapa zmniejszona (${esc(fx.shrinkBy || '')}) — ${s.toFixed(1)} s`);
-  const revBy = {};
+  const revBy = {}, fastBy = {};
   for (const e of fx.players) {
     const g = secs(e.ghostUntil);
     if (g > 0) lines.push(`👻 ${name(e.idx)} przenika linie — ${g.toFixed(1)} s`);
     const r = secs(e.reverseUntil);
     if (r > 0) (revBy[e.reverseBy] ||= { t: r, who: [] }).who.push(name(e.idx));
+    const f = secs(e.speedUntil);
+    if (f > 0) (fastBy[e.speedBy] ||= { t: f, who: [] }).who.push(name(e.idx));
   }
+  for (const [by, v] of Object.entries(fastBy)) lines.push(`⚡ Przyspieszenie 2× (od ${esc(by)}): ${v.who.join(', ')} — ${v.t.toFixed(1)} s`);
   for (const [by, v] of Object.entries(revBy)) lines.push(`🔄 Odwrócone sterowanie (od ${esc(by)}): ${v.who.join(', ')} — ${v.t.toFixed(1)} s`);
   $('fx').innerHTML = lines.join('<br>');
 
@@ -291,9 +299,10 @@ function updateHud() {
   for (const p of mine) {
     const e = fxPlayer(p.idx);
     if (!e || !p.alive) continue;
-    const r = secs(e.reverseUntil), g = secs(e.ghostUntil);
+    const r = secs(e.reverseUntil), g = secs(e.ghostUntil), f = secs(e.speedUntil);
     const who = mine.length > 1 ? esc(p.name) + ': ' : '';
     if (r > 0) alerts.push(`<div class="rev">🔄 ${who}ODWRÓCONE STEROWANIE ${Math.ceil(r)} s</div>`);
+    if (f > 0) alerts.push(`<div class="fast">⚡ ${who}PRZYSPIESZENIE 2× ${Math.ceil(f)} s</div>`);
     if (g > 0) alerts.push(`<div class="ghost">👻 ${who}PRZENIKASZ PRZEZ LINIE ${Math.ceil(g)} s</div>`);
   }
   $('alert').innerHTML = alerts.join('');
