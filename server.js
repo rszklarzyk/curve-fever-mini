@@ -18,13 +18,15 @@ const END_PAUSE = 180;    // 3 s po końcu rundy
 const GAP_LEN = 14;       // długość dziury w linii (ticki)
 const SELF_GRACE = 14;    // ile ticków własny ślad jest "bezpieczny"
 // Bonusy
-const PU_TYPES = ['reverse', 'ghost', 'shrink', 'speed'];
+const PU_TYPES = ['reverse', 'ghost', 'shrink', 'speed', 'beer', 'vodka'];
 const PU_R = 12;          // promień bonusu
 const PU_MAX = 3;         // maks. bonusów na mapie naraz
 const EFFECT = 10 * TPS;  // czas działania bonusu (10 s)
 const SHRINK = 0.1;       // o tyle mapa kurczy się z każdej strony (razem 20%)
 const SHRINK_ANIM = 2 * TPS; // kurczenie trwa 2 s
 const FAST = 2;           // mnożnik prędkości przeciwników po bonusie "speed"
+const BEER_FAST = 1.5;    // Czarna Perła: zbierający jedzie 1.5x szybciej (i przenika linie)
+const FREEZE = 15 * TPS;  // Soplica: WSZYSCY (też zbierający) stoją w miejscu 15 s
 const COLORS = ['#ff4d4d', '#4da6ff', '#5cd65c', '#ffd11a', '#d966ff', '#ff9933', '#33ffcc', '#ff66b3'];
 
 const rooms = new Map();
@@ -61,7 +63,7 @@ function stopGame(room) {
 }
 
 function newRound(room) {
-  room.grid = new Int32Array(W * H);   // tick, w którym piksel został zamalowany
+  room.grid = new Int32Array(W * H);   // moveTick gracza w chwili zamalowania piksela
   room.owner = new Uint16Array(W * H); // idx gracza
   room.tick = 0;
   room.countdown = COUNTDOWN;
@@ -72,13 +74,16 @@ function newRound(room) {
   room.nextPuId = 1;
   room.shrinkStart = room.shrinkEnd = 0;
   room.shrinkBy = null;
+  room.freezeStart = room.freezeEnd = 0;
+  room.freezeBy = null;
   for (const p of room.players.values()) {
-    p.reverseUntil = p.ghostUntil = p.speedUntil = 0;
+    p.reverseUntil = p.ghostUntil = p.speedUntil = p.boostUntil = p.frozenUntil = 0;
     p.reverseBy = p.speedBy = null;
     p.alive = true;
     p.x = rand(100, W - 100);
     p.y = rand(100, H - 100);
     p.angle = rand(0, Math.PI * 2);
+    p.moveTick = 0;
     p.gapLeft = 0;
     p.gapTimer = Math.floor(rand(90, 240));
   }
@@ -105,9 +110,10 @@ function sendFx(room) {
     tick: room.tick,
     powerups: room.powerups,
     shrinkStart: room.shrinkStart, shrinkEnd: room.shrinkEnd, shrinkBy: room.shrinkBy,
+    freezeStart: room.freezeStart, freezeEnd: room.freezeEnd, freezeBy: room.freezeBy,
     players: [...room.players.values()].map(p => ({
       idx: p.idx, reverseUntil: p.reverseUntil, reverseBy: p.reverseBy, ghostUntil: p.ghostUntil,
-      speedUntil: p.speedUntil, speedBy: p.speedBy,
+      speedUntil: p.speedUntil, speedBy: p.speedBy, boostUntil: p.boostUntil, frozenUntil: p.frozenUntil,
     })),
   });
 }
@@ -118,6 +124,13 @@ function applyPowerup(room, p, type) {
     for (const o of room.players.values()) if (o !== p && o.alive) { o.reverseUntil = until; o.reverseBy = p.name; }
   } else if (type === 'speed') {
     for (const o of room.players.values()) if (o !== p && o.alive) { o.speedUntil = until; o.speedBy = p.name; }
+  } else if (type === 'beer') {
+    p.boostUntil = p.ghostUntil = until;
+  } else if (type === 'vodka') {
+    room.freezeStart = room.tick;
+    room.freezeEnd = room.tick + FREEZE;
+    room.freezeBy = p.name;
+    for (const o of room.players.values()) if (o.alive) o.frozenUntil = room.freezeEnd;
   } else if (type === 'ghost') {
     p.ghostUntil = until;
   } else if (type === 'shrink') {
@@ -138,7 +151,7 @@ function hits(room, p, x, y) {
       const i = (cy + dy) * W + (cx + dx);
       const t = room.grid[i];
       if (!t) continue;
-      if (room.owner[i] !== p.idx || t < room.tick - SELF_GRACE) return true;
+      if (room.owner[i] !== p.idx || t < p.moveTick - SELF_GRACE) return true;
     }
   }
   return false;
@@ -152,7 +165,7 @@ function paint(room, p) {
       const x = cx + dx, y = cy + dy;
       if (x < 0 || y < 0 || x >= W || y >= H) continue;
       const i = y * W + x;
-      if (!room.grid[i]) { room.grid[i] = room.tick; room.owner[i] = p.idx; }
+      if (!room.grid[i]) { room.grid[i] = p.moveTick; room.owner[i] = p.idx; }
     }
   }
 }
@@ -169,8 +182,10 @@ function step(room) {
   const died = [];
 
   for (const p of alive) {
+    if (p.frozenUntil > room.tick) { p.drawing = false; continue; } // Soplica: stoi w miejscu
+    p.moveTick++; // liczy tylko ticki ruchu (wiek własnego śladu)
     p.angle += (p.reverseUntil > room.tick ? -p.turn : p.turn) * TURN;
-    const sp = SPEED * (p.speedUntil > room.tick ? FAST : 1);
+    const sp = SPEED * (p.speedUntil > room.tick ? FAST : 1) * (p.boostUntil > room.tick ? BEER_FAST : 1);
     p.x += Math.cos(p.angle) * sp;
     p.y += Math.sin(p.angle) * sp;
 
@@ -194,7 +209,7 @@ function step(room) {
     }
   }
   // Pojawianie się nowych bonusów
-  if (--room.puTimer <= 0) {
+  if (room.tick >= room.freezeEnd && --room.puTimer <= 0) { // w czasie Soplicy nic nowego się nie pojawia
     room.puTimer = Math.floor(rand(3, 6) * TPS);
     if (room.powerups.length < PU_MAX) {
       const b = bounds(room), m = 40;
