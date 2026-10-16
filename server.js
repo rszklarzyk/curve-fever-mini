@@ -17,6 +17,13 @@ const COUNTDOWN = 120;    // 2 s przed startem rundy
 const END_PAUSE = 180;    // 3 s po końcu rundy
 const GAP_LEN = 14;       // długość dziury w linii (ticki)
 const SELF_GRACE = 14;    // ile ticków własny ślad jest "bezpieczny"
+// Bonusy
+const PU_TYPES = ['reverse', 'ghost', 'shrink'];
+const PU_R = 12;          // promień bonusu
+const PU_MAX = 3;         // maks. bonusów na mapie naraz
+const EFFECT = 10 * TPS;  // czas działania bonusu (10 s)
+const SHRINK = 0.1;       // o tyle mapa kurczy się z każdej strony (razem 20%)
+const SHRINK_ANIM = 2 * TPS; // kurczenie trwa 2 s
 const COLORS = ['#ff4d4d', '#4da6ff', '#5cd65c', '#ffd11a', '#d966ff', '#ff9933', '#33ffcc', '#ff66b3'];
 
 const rooms = new Map();
@@ -59,7 +66,14 @@ function newRound(room) {
   room.countdown = COUNTDOWN;
   room.endTimer = 0;
   room.roundPlayers = room.players.size;
+  room.powerups = [];
+  room.puTimer = Math.floor(rand(1.5, 3) * TPS);
+  room.nextPuId = 1;
+  room.shrinkStart = room.shrinkEnd = 0;
+  room.shrinkBy = null;
   for (const p of room.players.values()) {
+    p.reverseUntil = p.ghostUntil = 0;
+    p.reverseBy = null;
     p.alive = true;
     p.x = rand(100, W - 100);
     p.y = rand(100, H - 100);
@@ -74,11 +88,45 @@ function newRound(room) {
     }),
     countdown: COUNTDOWN / TPS,
   });
+  sendFx(room);
   sendLobby(room);
 }
 
+// Aktualne granice mapy (mniejsze, gdy działa bonus "shrink")
+function bounds(room) {
+  let k = 0;
+  if (room.tick < room.shrinkEnd) k = SHRINK * Math.min(1, (room.tick - room.shrinkStart) / SHRINK_ANIM);
+  return { x0: W * k, y0: H * k, x1: W * (1 - k), y1: H * (1 - k) };
+}
+
+function sendFx(room) {
+  io.to(room.id).emit('fx', {
+    tick: room.tick,
+    powerups: room.powerups,
+    shrinkStart: room.shrinkStart, shrinkEnd: room.shrinkEnd, shrinkBy: room.shrinkBy,
+    players: [...room.players.values()].map(p => ({
+      idx: p.idx, reverseUntil: p.reverseUntil, reverseBy: p.reverseBy, ghostUntil: p.ghostUntil,
+    })),
+  });
+}
+
+function applyPowerup(room, p, type) {
+  const until = room.tick + EFFECT;
+  if (type === 'reverse') {
+    for (const o of room.players.values()) if (o !== p && o.alive) { o.reverseUntil = until; o.reverseBy = p.name; }
+  } else if (type === 'ghost') {
+    p.ghostUntil = until;
+  } else if (type === 'shrink') {
+    if (room.tick >= room.shrinkEnd) room.shrinkStart = room.tick;
+    room.shrinkEnd = until;
+    room.shrinkBy = p.name;
+  }
+}
+
 function hits(room, p, x, y) {
-  if (x < R || y < R || x >= W - R || y >= H - R) return true;
+  const b = bounds(room);
+  if (x < b.x0 + R || y < b.y0 + R || x >= b.x1 - R || y >= b.y1 - R) return true;
+  if (p.ghostUntil > room.tick) return false; // przenikanie przez linie
   const cx = Math.round(x), cy = Math.round(y);
   for (let dy = -R; dy <= R; dy++) {
     for (let dx = -R; dx <= R; dx++) {
@@ -117,7 +165,7 @@ function step(room) {
   const died = [];
 
   for (const p of alive) {
-    p.angle += p.turn * TURN;
+    p.angle += (p.reverseUntil > room.tick ? -p.turn : p.turn) * TURN;
     p.x += Math.cos(p.angle) * SPEED;
     p.y += Math.sin(p.angle) * SPEED;
 
@@ -129,13 +177,40 @@ function step(room) {
   }
   for (const p of alive) if (p.drawing && !died.includes(p)) paint(room, p);
 
+  // Zbieranie bonusów
+  let fxChanged = false;
+  for (const p of alive) {
+    if (died.includes(p)) continue;
+    const hit = room.powerups.find(u => (u.x - p.x) ** 2 + (u.y - p.y) ** 2 < (PU_R + R + 2) ** 2);
+    if (hit) {
+      room.powerups = room.powerups.filter(u => u !== hit);
+      applyPowerup(room, p, hit.type);
+      fxChanged = true;
+    }
+  }
+  // Pojawianie się nowych bonusów
+  if (--room.puTimer <= 0) {
+    room.puTimer = Math.floor(rand(3, 6) * TPS);
+    if (room.powerups.length < PU_MAX) {
+      const b = bounds(room), m = 40;
+      room.powerups.push({
+        id: room.nextPuId++,
+        type: PU_TYPES[Math.floor(Math.random() * PU_TYPES.length)],
+        x: Math.round(rand(b.x0 + m, b.x1 - m)),
+        y: Math.round(rand(b.y0 + m, b.y1 - m)),
+      });
+      fxChanged = true;
+    }
+  }
+  if (fxChanged) sendFx(room);
+
   // Punkt dla każdego, kto przeżył czyjąś śmierć
   for (const d of died) {
     d.alive = false;
     for (const p of room.players.values()) if (p.alive) p.score++;
   }
 
-  io.to(room.id).emit('tick', alive.map(p => [p.idx, +p.x.toFixed(1), +p.y.toFixed(1), p.drawing ? 1 : 0, p.alive ? 1 : 0]));
+  io.to(room.id).emit('tick', room.tick, alive.map(p => [p.idx, +p.x.toFixed(1), +p.y.toFixed(1), p.drawing ? 1 : 0, p.alive ? 1 : 0]));
   if (died.length) sendLobby(room);
 
   const left = [...room.players.values()].filter(p => p.alive);
