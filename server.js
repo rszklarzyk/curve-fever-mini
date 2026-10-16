@@ -9,7 +9,7 @@ app.use(express.static(__dirname + '/public'));
 
 // --- Ustawienia gry ---
 const W = 800, H = 600;
-const SPEED = 1.6;        // px na tick
+const SPEED = 1.12;       // px na tick (o 30% wolniej niż pierwotne 1.6)
 const TURN = 0.065;       // rad na tick
 const R = 2;              // promień linii (grubość = 4px)
 const TPS = 60;           // ticki na sekundę
@@ -18,12 +18,13 @@ const END_PAUSE = 180;    // 3 s po końcu rundy
 const GAP_LEN = 14;       // długość dziury w linii (ticki)
 const SELF_GRACE = 14;    // ile ticków własny ślad jest "bezpieczny"
 // Bonusy
-const PU_TYPES = ['reverse', 'ghost', 'shrink'];
+const PU_TYPES = ['reverse', 'ghost', 'shrink', 'speed'];
 const PU_R = 12;          // promień bonusu
 const PU_MAX = 3;         // maks. bonusów na mapie naraz
 const EFFECT = 10 * TPS;  // czas działania bonusu (10 s)
 const SHRINK = 0.1;       // o tyle mapa kurczy się z każdej strony (razem 20%)
 const SHRINK_ANIM = 2 * TPS; // kurczenie trwa 2 s
+const FAST = 2;           // mnożnik prędkości przeciwników po bonusie "speed"
 const COLORS = ['#ff4d4d', '#4da6ff', '#5cd65c', '#ffd11a', '#d966ff', '#ff9933', '#33ffcc', '#ff66b3'];
 
 const rooms = new Map();
@@ -72,8 +73,8 @@ function newRound(room) {
   room.shrinkStart = room.shrinkEnd = 0;
   room.shrinkBy = null;
   for (const p of room.players.values()) {
-    p.reverseUntil = p.ghostUntil = 0;
-    p.reverseBy = null;
+    p.reverseUntil = p.ghostUntil = p.speedUntil = 0;
+    p.reverseBy = p.speedBy = null;
     p.alive = true;
     p.x = rand(100, W - 100);
     p.y = rand(100, H - 100);
@@ -106,6 +107,7 @@ function sendFx(room) {
     shrinkStart: room.shrinkStart, shrinkEnd: room.shrinkEnd, shrinkBy: room.shrinkBy,
     players: [...room.players.values()].map(p => ({
       idx: p.idx, reverseUntil: p.reverseUntil, reverseBy: p.reverseBy, ghostUntil: p.ghostUntil,
+      speedUntil: p.speedUntil, speedBy: p.speedBy,
     })),
   });
 }
@@ -114,6 +116,8 @@ function applyPowerup(room, p, type) {
   const until = room.tick + EFFECT;
   if (type === 'reverse') {
     for (const o of room.players.values()) if (o !== p && o.alive) { o.reverseUntil = until; o.reverseBy = p.name; }
+  } else if (type === 'speed') {
+    for (const o of room.players.values()) if (o !== p && o.alive) { o.speedUntil = until; o.speedBy = p.name; }
   } else if (type === 'ghost') {
     p.ghostUntil = until;
   } else if (type === 'shrink') {
@@ -166,8 +170,9 @@ function step(room) {
 
   for (const p of alive) {
     p.angle += (p.reverseUntil > room.tick ? -p.turn : p.turn) * TURN;
-    p.x += Math.cos(p.angle) * SPEED;
-    p.y += Math.sin(p.angle) * SPEED;
+    const sp = SPEED * (p.speedUntil > room.tick ? FAST : 1);
+    p.x += Math.cos(p.angle) * sp;
+    p.y += Math.sin(p.angle) * sp;
 
     if (p.gapLeft > 0) p.gapLeft--;
     else if (--p.gapTimer <= 0) { p.gapLeft = GAP_LEN; p.gapTimer = Math.floor(rand(90, 240)); }
